@@ -1,0 +1,15 @@
+name: FlashbackServerRecorder
+version: '${version}'
+main: com.moulberry.flashback.serverrecorder.FlashbackServerRecorder
+api-version: '26.1'
+description: Records gameplay on the server into replays that can be opened with the Flashback mod.
+authors: [Moulberry, flashback contributors]
+commands:
+  fbrec:
+    description: Control server-side Flashback recordings
+    usage: /fbrec <player|camera|stop|list|marker|hud> ...
+    permission: flashbackrecorder.admin
+permissions:
+  flashbackrecorder.admin:
+    description: Allows controlling server-side Flashback recordings
+    default: op

@@ -1,0 +1,28 @@
+# Where finished replays (.zip) are saved, relative to the plugin folder unless absolute.
+# Copy the zip into .minecraft/flashback/replays on your client to open it with Flashback.
+output-folder: replays
+
+# Flashback stores replays in chunks, each starting with a full snapshot of the world.
+# Shorter chunks make seeking faster but cost a short main-thread pause to build the snapshot.
+segment-length-seconds: 300
+
+# Default view distance (in chunks) of recording cameras.
+camera-view-distance: 8
+
+# Add a timeline marker whenever a player dies in a recorded world.
+death-markers: true
+
+# Automatically record arenas: recording starts when at least `min-players` players are in the
+# world and stops (and exports) when the world becomes empty again.
+auto-record:
+  enabled: false
+  arenas:
+    example:
+      world: world
+      x: 0.5
+      y: 100
+      z: 0.5
+      yaw: 0
+      pitch: 30
+      view-distance: 8
+      min-players: 1
