@@ -6,23 +6,21 @@ output-folder: replays
 # Shorter chunks make seeking faster but cost a short main-thread pause to build the snapshot.
 segment-length-seconds: 300
 
-# Default view distance (in chunks) of recording cameras.
-camera-view-distance: 8
+# View distance (in chunks) written into the replay.
+view-distance: 12
 
 # Add a timeline marker whenever a player dies in a recorded world.
 death-markers: true
 
-# Automatically record arenas: recording starts when at least `min-players` players are in the
+# Automatically record worlds/arenas: recording starts when at least `min-players` players are in the
 # world and stops (and exports) when the world becomes empty again.
+# Without x/z/radius the whole world is recorded, otherwise only a square of `radius` blocks around x/z.
 auto-record:
   enabled: false
   arenas:
     example:
       world: world
-      x: 0.5
-      y: 100
-      z: 0.5
-      yaw: 0
-      pitch: 30
-      view-distance: 8
+      # x: 0
+      # z: 0
+      # radius: 64
       min-players: 1

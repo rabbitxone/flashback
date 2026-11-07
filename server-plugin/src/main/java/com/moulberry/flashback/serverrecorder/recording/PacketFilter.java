@@ -2,112 +2,61 @@ package com.moulberry.flashback.serverrecorder.recording;
 
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.Packet;
-import net.minecraft.network.protocol.common.*;
-import net.minecraft.network.protocol.configuration.ClientboundCodeOfConductPacket;
-import net.minecraft.network.protocol.configuration.ClientboundFinishConfigurationPacket;
-import net.minecraft.network.protocol.cookie.ClientboundCookieRequestPacket;
 import net.minecraft.network.protocol.game.*;
-import net.minecraft.network.protocol.ping.ClientboundPongResponsePacket;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Set;
 
 /**
- * Decides which clientbound packets end up in the replay.
+ * Decides which packets seen by players are copied into a world recording.
  * <p>
- * Based on {@code com.moulberry.flashback.record.IgnoredPacketSet}. The main difference is that the mod
- * captures sounds/level events client-side (so it ignores them on the network), while on the server the
- * network packets are the only source of those, so we keep them.
- * Entity movement packets are dropped because positions are written every tick with the
- * {@code move_entities} action using exact server-side positions.
+ * Only "world" packets are copied: things that every nearby player receives in the same way (block
+ * changes, sounds, particles, entity metadata...). Entity spawning/removal, positions, the player list,
+ * time and weather are generated from the server state instead, so they're never copied.
  */
 public final class PacketFilter {
 
-    private static final Set<Class<?>> IGNORED = Set.of(
-        // Common
-        ClientboundStoreCookiePacket.class,
-        ClientboundCustomReportDetailsPacket.class,
-        ClientboundServerLinksPacket.class,
-        ClientboundCookieRequestPacket.class,
-        ClientboundDisconnectPacket.class,
-        ClientboundPingPacket.class,
-        ClientboundKeepAlivePacket.class,
-        ClientboundTransferPacket.class,
-        ClientboundClearDialogPacket.class,
-        ClientboundShowDialogPacket.class,
-        ClientboundCustomPayloadPacket.class,
-        ClientboundResourcePackPushPacket.class,
-        ClientboundResourcePackPopPacket.class,
-        ClientboundUpdateTagsPacket.class,
-
-        // Configuration
-        ClientboundFinishConfigurationPacket.class,
-        ClientboundCodeOfConductPacket.class,
-
-        // Game
-        ClientboundAwardStatsPacket.class,
-        ClientboundRecipeBookAddPacket.class,
-        ClientboundRecipeBookRemovePacket.class,
-        ClientboundRecipeBookSettingsPacket.class,
-        ClientboundOpenSignEditorPacket.class,
-        ClientboundRotateHeadPacket.class,
-        ClientboundMoveEntityPacket.Pos.class,
-        ClientboundMoveEntityPacket.Rot.class,
-        ClientboundMoveEntityPacket.PosRot.class,
-        ClientboundPlayerPositionPacket.class,
-        ClientboundPlayerRotationPacket.class,
-        ClientboundDeleteChatPacket.class,
-        ClientboundMoveMinecartPacket.class,
-        ClientboundContainerClosePacket.class,
-        ClientboundContainerSetContentPacket.class,
-        ClientboundMountScreenOpenPacket.class,
-        ClientboundContainerSetDataPacket.class,
-        ClientboundContainerSetSlotPacket.class,
-        ClientboundForgetLevelChunkPacket.class,
-        ClientboundPlayerAbilitiesPacket.class,
-        ClientboundSetCursorItemPacket.class,
-        ClientboundSetExperiencePacket.class,
-        ClientboundSetHealthPacket.class,
-        ClientboundSetHeldSlotPacket.class,
-        ClientboundSetPlayerInventoryPacket.class,
-        ClientboundTickingStatePacket.class,
-        ClientboundTickingStepPacket.class,
-        ClientboundPlayerCombatEndPacket.class,
-        ClientboundPlayerCombatEnterPacket.class,
-        ClientboundPlayerCombatKillPacket.class,
-        ClientboundSetCameraPacket.class,
-        ClientboundCooldownPacket.class,
-        ClientboundUpdateAdvancementsPacket.class,
-        ClientboundSelectAdvancementsTabPacket.class,
-        ClientboundPlaceGhostRecipePacket.class,
-        ClientboundCommandsPacket.class,
-        ClientboundCommandSuggestionsPacket.class,
-        ClientboundUpdateRecipesPacket.class,
-        ClientboundTagQueryPacket.class,
-        ClientboundOpenBookPacket.class,
-        ClientboundOpenScreenPacket.class,
-        ClientboundMerchantOffersPacket.class,
-        ClientboundSetChunkCacheRadiusPacket.class,
-        ClientboundSetSimulationDistancePacket.class,
-        ClientboundSetChunkCacheCenterPacket.class,
-        ClientboundBlockChangedAckPacket.class,
-        ClientboundCustomChatCompletionsPacket.class,
-        ClientboundChunkBatchStartPacket.class,
-        ClientboundChunkBatchFinishedPacket.class,
-        ClientboundDebugSamplePacket.class,
-        ClientboundPongResponsePacket.class,
-        ClientboundTestInstanceBlockStatus.class,
-        ClientboundTrackedWaypointPacket.class,
-        ClientboundDebugChunkValuePacket.class,
-        ClientboundDebugBlockValuePacket.class,
-        ClientboundDebugEntityValuePacket.class,
-        ClientboundDebugEventPacket.class,
-        ClientboundGameRuleValuesPacket.class,
-        ClientboundLowDiskSpaceWarningPacket.class,
-        ClientboundServerDataPacket.class
+    private static final Set<Class<?>> WORLD_PACKETS = Set.of(
+        // Blocks & chunks
+        ClientboundBlockUpdatePacket.class,
+        ClientboundSectionBlocksUpdatePacket.class,
+        ClientboundBlockEventPacket.class,
+        ClientboundBlockEntityDataPacket.class,
+        ClientboundBlockDestructionPacket.class,
+        ClientboundLevelChunkWithLightPacket.class,
+        ClientboundLightUpdatePacket.class,
+        ClientboundChunksBiomesPacket.class,
+        // Effects
+        ClientboundLevelEventPacket.class,
+        ClientboundLevelParticlesPacket.class,
+        ClientboundExplodePacket.class,
+        ClientboundSoundPacket.class,
+        ClientboundSoundEntityPacket.class,
+        // Entities
+        ClientboundSetEntityDataPacket.class,
+        ClientboundSetEquipmentPacket.class,
+        ClientboundUpdateAttributesPacket.class,
+        ClientboundAnimatePacket.class,
+        ClientboundSwingAnimationPacket.class,
+        ClientboundHurtAnimationPacket.class,
+        ClientboundDamageEventPacket.class,
+        ClientboundEntityEventPacket.class,
+        ClientboundSetPassengersPacket.class,
+        ClientboundSetEntityLinkPacket.class,
+        ClientboundUpdateMobEffectPacket.class,
+        ClientboundRemoveMobEffectPacket.class,
+        ClientboundTakeItemEntityPacket.class,
+        ClientboundSetEntityMotionPacket.class,
+        ClientboundProjectilePowerPacket.class,
+        // World border
+        ClientboundSetBorderCenterPacket.class,
+        ClientboundSetBorderLerpSizePacket.class,
+        ClientboundSetBorderSizePacket.class,
+        ClientboundSetBorderWarningDelayPacket.class,
+        ClientboundSetBorderWarningDistancePacket.class
     );
 
-    /** HUD-like packets that can be copied from a "HUD source" player into a camera recording. */
+    /** HUD packets, copied only from the recording's "HUD source" player. */
     private static final Set<Class<?>> HUD_PACKETS = Set.of(
         ClientboundSetPlayerTeamPacket.class,
         ClientboundSetObjectivePacket.class,
@@ -126,8 +75,8 @@ public final class PacketFilter {
         ClientboundSetActionBarTextPacket.class
     );
 
-    public static boolean isIgnored(Packet<?> packet) {
-        return IGNORED.contains(packet.getClass());
+    public static boolean isWorldPacket(Packet<?> packet) {
+        return WORLD_PACKETS.contains(packet.getClass());
     }
 
     public static boolean isHudPacket(Packet<?> packet) {
@@ -135,8 +84,7 @@ public final class PacketFilter {
     }
 
     /**
-     * Applies the same conversions the Flashback mod does when recording.
-     * Signed player chat can't be replayed (signatures/session would be invalid), so it becomes system chat.
+     * Signed player chat can't be replayed, so it becomes system chat (same as the Flashback mod does).
      *
      * @return the packet to record, or null to drop it
      */

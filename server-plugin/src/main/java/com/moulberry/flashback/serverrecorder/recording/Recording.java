@@ -4,26 +4,14 @@ import com.moulberry.flashback.serverrecorder.format.FlashbackFormat;
 import com.moulberry.flashback.serverrecorder.format.ReplayFileWriter;
 import com.moulberry.flashback.serverrecorder.format.ReplayMarker;
 import com.moulberry.flashback.serverrecorder.format.ReplayMetadata;
-import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
-import it.unimi.dsi.fastutil.ints.IntSet;
 import net.minecraft.SharedConstants;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
-import net.minecraft.network.protocol.game.ClientboundBundlePacket;
-import net.minecraft.network.protocol.game.ClientboundStartConfigurationPacket;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
-import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
@@ -34,15 +22,12 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * A single server-side recording that produces one Flashback replay.
+ * Format/bookkeeping side of a recording: replay chunk files ("segments"), snapshots, ticks,
+ * markers and exporting. What is recorded is decided by subclasses.
  * <p>
- * Data comes from two places:
- * <ul>
- *     <li>clientbound packets sent to the {@link #viewer()} (captured on whatever thread sends them), and</li>
- *     <li>data generated on the main thread at the end of every tick (entity positions, snapshots, ...).</li>
- * </ul>
- * To keep both in the right order, main thread data is handed over with {@link #runSequenced(Runnable)},
- * which for real players runs on the player's netty event loop (the same thread that sees the packets).
+ * Packets may be written from any thread with {@link #writePacket(Packet)}; main-thread data is written
+ * at the end of every tick by {@link #tick()}. Both go through the same lock, so the replay stream
+ * keeps the order in which data arrived.
  */
 public abstract class Recording {
 
@@ -52,7 +37,7 @@ public abstract class Recording {
     private final Path outputZip;
     private final int segmentLengthTicks;
 
-    // --- State owned by the sequenced side (guarded by "this")
+    // Guarded by "this"
     private final ReplayMetadata metadata = new ReplayMetadata();
     private boolean acceptingPackets = false;
     private boolean stopped = false;
@@ -61,23 +46,23 @@ public abstract class Recording {
     private long lastRtcMillis = 0;
     private boolean forceRtc = true;
 
-    // --- State owned by the main thread
+    // Main thread
     private boolean needsInitialSnapshot = true;
     private int mainTicksInSegment = 0;
     private int mainTotalTicks = 0;
     private boolean stopRequested = false;
-    private @Nullable ResourceKey<Level> lastDimension = null;
-    private final Int2ObjectMap<Position> lastPositions = new Int2ObjectOpenHashMap<>();
     private @Nullable CompletableFuture<Path> result = null;
 
-    private record Position(double x, double y, double z, float yaw, float pitch, float headYaw, boolean onGround) {
-        Position {
+    public record Position(double x, double y, double z, float yaw, float pitch, float headYaw, boolean onGround) {
+        public Position {
             yaw = Mth.wrapDegrees(yaw);
             pitch = Mth.wrapDegrees(pitch);
             headYaw = Mth.wrapDegrees(headYaw);
         }
     }
-    private record IdAndPosition(int id, Position position) {}
+
+    public record IdAndPosition(int id, Position position) {
+    }
 
     protected Recording(Logger logger, String name, Path tempFolder, Path outputZip, int segmentLengthTicks, ServerLevel level) throws IOException {
         this.logger = logger;
@@ -97,7 +82,6 @@ public abstract class Recording {
         return this.name;
     }
 
-    /** @return the number of ticks recorded so far */
     public int recordedTicks() {
         return this.mainTotalTicks;
     }
@@ -106,143 +90,70 @@ public abstract class Recording {
         return this.stopRequested;
     }
 
-    /** The player whose point of view is recorded. */
-    public abstract ServerPlayer viewer();
+    public abstract ServerLevel level();
 
-    /** Runs the task in order with the packets sent to {@link #viewer()}. */
-    protected abstract void runSequenced(Runnable runnable);
+    /** Builds a full snapshot of the current state. Main thread. */
+    protected abstract Snapshot buildSnapshot();
 
-    /** Game mode of the local player inside the replay. */
-    protected abstract GameType localGameType();
+    /** Collects the packets and entity positions for the tick that just ended. Main thread. */
+    protected abstract void collectTick(List<Packet<? super ClientGamePacketListener>> packets, List<IdAndPosition> positions);
 
-    /** Player whose HUD (scoreboard, tab list, boss bars) is recorded, may be null. */
-    public abstract @Nullable ServerPlayer hudSource();
-
-    protected abstract boolean isCamera();
-
-    /** Extra main-thread packets to write this tick (e.g. local player state). */
-    protected void collectTickPackets(ServerPlayer viewer, List<Packet<? super ClientGamePacketListener>> packets) {
-    }
-
-    /** Extra mode specific filtering of captured packets. */
-    protected boolean shouldRecord(Packet<?> packet) {
-        return true;
-    }
-
-    /** Called when the recording has been stopped, to release resources (handlers, cameras, ...). */
+    /** Releases listeners etc. once the recording is stopped. Main thread. */
     protected void cleanup() {
     }
 
-    // ---------------------------------------------------------------------------------------------
-    // Packet capture
-
-    /**
-     * Called for every clientbound packet sent to the viewer, on the thread that writes it.
-     */
-    public final void onPacket(Packet<?> packet) {
-        if (packet instanceof ClientboundBundlePacket bundle) {
-            for (Packet<? super ClientGamePacketListener> subPacket : bundle.subPackets()) {
-                this.onPacket(subPacket);
-            }
-            return;
-        }
-        if (packet instanceof ClientboundStartConfigurationPacket) {
-            this.onConfigurationPhase();
-            return;
-        }
-        if (PacketFilter.isIgnored(packet) || !this.shouldRecord(packet)) {
-            return;
-        }
-        Packet<?> transformed = PacketFilter.transform(packet);
-        if (transformed == null) {
-            return;
-        }
-
-        synchronized (this) {
-            if (!this.acceptingPackets || this.stopped) {
-                return;
-            }
-            //noinspection unchecked
-            this.out.writeGamePacket((Packet<? super ClientGamePacketListener>) transformed);
-        }
-    }
-
-    /** The viewer is being sent back into the configuration phase, which can't be represented. */
-    protected void onConfigurationPhase() {
-        synchronized (this) {
-            this.acceptingPackets = false;
-        }
-    }
-
-    /** Writes a packet generated on the main thread in order with the captured packets. */
-    public final void writeSynthetic(Packet<? super ClientGamePacketListener> packet) {
-        this.runSequenced(() -> {
-            synchronized (this) {
-                if (this.acceptingPackets && !this.stopped) {
-                    this.out.writeGamePacket(packet);
-                }
-            }
-        });
+    /** Called at the end of every tick, after everything was written. Main thread. */
+    protected void afterTick() {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Main thread
+
+    /** Writes a packet to the replay. Can be called from any thread. */
+    public final void writePacket(Packet<? super ClientGamePacketListener> packet) {
+        synchronized (this) {
+            if (this.acceptingPackets && !this.stopped) {
+                this.out.writeGamePacket(packet);
+            }
+        }
+    }
 
     /** Must be called on the main thread at the end of every server tick. */
     public final void tick() {
         if (this.stopRequested) {
             return;
         }
-        ServerPlayer viewer = this.viewer();
-        if (viewer == null || viewer.isRemoved() || viewer.hasDisconnected()) {
-            this.logger.info("Viewer of recording '{}' is gone, stopping", this.name);
-            this.stop();
-            return;
-        }
-
-        ResourceKey<Level> dimension = viewer.level().dimension();
-        boolean changedDimension = this.lastDimension != null && this.lastDimension != dimension;
-        this.lastDimension = dimension;
 
         Snapshot initialSnapshot = null;
         if (this.needsInitialSnapshot) {
             this.needsInitialSnapshot = false;
-            initialSnapshot = this.buildSnapshot(viewer);
+            initialSnapshot = this.buildSnapshot();
         }
 
-        List<Packet<? super ClientGamePacketListener>> tickPackets = new ArrayList<>();
-        this.collectTickPackets(viewer, tickPackets);
-        List<IdAndPosition> positions = this.collectPositions(viewer);
+        List<Packet<? super ClientGamePacketListener>> packets = new ArrayList<>();
+        List<IdAndPosition> positions = new ArrayList<>();
+        if (initialSnapshot == null) {
+            this.collectTick(packets, positions);
+        }
 
         this.mainTicksInSegment += 1;
         this.mainTotalTicks += 1;
 
         Snapshot nextSegmentSnapshot = null;
-        if (this.mainTicksInSegment >= this.segmentLengthTicks || changedDimension) {
+        if (this.mainTicksInSegment >= this.segmentLengthTicks) {
             this.mainTicksInSegment = 0;
-            nextSegmentSnapshot = this.buildSnapshot(viewer);
+            nextSegmentSnapshot = this.buildSnapshot();
         }
 
-        Snapshot finalInitialSnapshot = initialSnapshot;
-        Snapshot finalNextSegmentSnapshot = nextSegmentSnapshot;
-        boolean markDimensionChange = changedDimension;
-        String dimensionName = dimension.identifier().toString();
-        this.runSequenced(() -> {
-            synchronized (this) {
-                if (this.stopped) {
-                    return;
-                }
-                if (finalInitialSnapshot != null) {
-                    this.writeSnapshot(finalInitialSnapshot);
+        ResourceKey<Level> dimension = this.level().dimension();
+        synchronized (this) {
+            if (!this.stopped) {
+                if (initialSnapshot != null) {
+                    this.writeSnapshot(initialSnapshot);
                     this.acceptingPackets = true;
                 }
-                if (!this.acceptingPackets) {
-                    // Viewer is in the configuration phase, nothing sensible can be recorded
-                    return;
-                }
                 this.writeRealTimeClock();
-                if (!tickPackets.isEmpty()) {
-                    this.out.writeGamePackets(tickPackets);
+                if (!packets.isEmpty()) {
+                    this.out.writeGamePackets(packets);
                 }
                 if (!positions.isEmpty()) {
                     this.writePositions(positions, dimension);
@@ -251,74 +162,25 @@ public abstract class Recording {
                 this.ticksInSegment += 1;
                 this.totalTicks += 1;
 
-                if (finalNextSegmentSnapshot != null) {
-                    if (markDimensionChange) {
-                        this.metadata.markers.put(this.totalTicks, ReplayMarker.of(0xAA00AA, "Changed dimension to " + dimensionName));
-                    }
+                if (nextSegmentSnapshot != null) {
                     this.flushSegment();
-                    this.writeSnapshot(finalNextSegmentSnapshot);
+                    this.writeSnapshot(nextSegmentSnapshot);
                 }
-            }
-        });
-    }
-
-    private Snapshot buildSnapshot(ServerPlayer viewer) {
-        // Positions are part of the snapshot, so everything needs to be re-sent afterwards
-        this.lastPositions.clear();
-        return SnapshotBuilder.build(viewer, this.localGameType(), this.hudSource(), this.isCamera());
-    }
-
-    private List<IdAndPosition> collectPositions(ServerPlayer viewer) {
-        ServerLevel level = viewer.level();
-        ChunkMap chunkMap = level.getChunkSource().chunkMap;
-        List<IdAndPosition> changed = new ArrayList<>();
-        IntSet seen = new IntOpenHashSet();
-
-        for (Int2ObjectMap.Entry<ChunkMap.TrackedEntity> entry : chunkMap.entityMap.int2ObjectEntrySet()) {
-            int id = entry.getIntKey();
-            boolean self = id == viewer.getId();
-            if (self) {
-                if (this.isCamera()) {
-                    continue;
-                }
-            } else if (!entry.getValue().seenBy.contains(viewer.connection)) {
-                continue;
-            }
-
-            Entity entity = level.getEntity(id);
-            if (entity == null || entity.isRemoved() || entity instanceof EnderDragonPart) {
-                continue;
-            }
-
-            Vec3 pos = entity.trackingPosition();
-            Position position = new Position(pos.x, pos.y, pos.z, entity.getYRot(), entity.getXRot(), entity.getYHeadRot(), entity.onGround());
-            seen.add(id);
-            Position last = this.lastPositions.put(id, position);
-            if (!position.equals(last)) {
-                changed.add(new IdAndPosition(id, position));
             }
         }
 
-        this.lastPositions.keySet().retainAll(seen);
-        return changed;
+        this.afterTick();
     }
 
-    /** Adds a marker at the current tick. Main thread only. */
     public final void addMarker(ReplayMarker marker) {
-        this.runSequenced(() -> {
-            synchronized (this) {
-                if (!this.stopped) {
-                    this.metadata.markers.put(this.totalTicks, marker);
-                }
+        synchronized (this) {
+            if (!this.stopped) {
+                this.metadata.markers.put(this.totalTicks, marker);
             }
-        });
+        }
     }
 
-    /**
-     * Stops the recording and exports the replay zip in the background. Main thread only.
-     *
-     * @return a future completed with the path of the exported zip
-     */
+    /** Stops the recording and exports the zip in the background. Main thread. */
     public final CompletableFuture<Path> stop() {
         if (this.result != null) {
             return this.result;
@@ -327,64 +189,56 @@ public abstract class Recording {
         CompletableFuture<Path> future = new CompletableFuture<>();
         this.result = future;
 
-        this.runSequenced(() -> {
-            synchronized (this) {
-                if (this.stopped) {
-                    return;
-                }
-                this.stopped = true;
-                if (this.totalTicks == 0 && !this.acceptingPackets) {
-                    this.out.abort();
-                    future.completeExceptionally(new IllegalStateException("Recording '" + this.name + "' didn't record anything"));
-                    return;
-                }
-                if (this.ticksInSegment == 0) {
-                    // Avoid empty replay chunks, Flashback doesn't like them
-                    this.out.submit(writer -> writer.writeEmptyAction(FlashbackFormat.ACTION_NEXT_TICK));
-                    this.ticksInSegment += 1;
-                    this.totalTicks += 1;
-                }
-                this.flushSegment();
-                this.out.finishAndExport(this.metadata, this.outputZip).whenComplete((path, error) -> {
-                    if (error != null) {
-                        future.completeExceptionally(error);
-                    } else {
-                        future.complete(path);
-                    }
-                });
-            }
-        });
-
         try {
             this.cleanup();
         } catch (Exception e) {
             this.logger.error("Error while cleaning up recording {}", this.name, e);
         }
+
+        synchronized (this) {
+            this.stopped = true;
+            if (!this.acceptingPackets) {
+                this.out.abort();
+                future.completeExceptionally(new IllegalStateException("Recording '" + this.name + "' didn't record anything"));
+                return future;
+            }
+            if (this.ticksInSegment == 0) {
+                this.out.submit(writer -> writer.writeEmptyAction(FlashbackFormat.ACTION_NEXT_TICK));
+                this.ticksInSegment += 1;
+                this.totalTicks += 1;
+            }
+            this.flushSegment();
+            this.out.finishAndExport(this.metadata, this.outputZip).whenComplete((path, error) -> {
+                if (error != null) {
+                    future.completeExceptionally(error);
+                } else {
+                    future.complete(path);
+                }
+            });
+        }
         return future;
     }
 
-    /** Stops the recording and deletes everything that was recorded. Main thread only. */
+    /** Stops the recording and deletes everything. Main thread. */
     public final void cancel() {
         if (this.result != null) {
             return;
         }
         this.stopRequested = true;
         this.result = CompletableFuture.failedFuture(new IllegalStateException("Recording '" + this.name + "' was cancelled"));
-        this.runSequenced(() -> {
-            synchronized (this) {
-                this.stopped = true;
-                this.out.abort();
-            }
-        });
         try {
             this.cleanup();
         } catch (Exception e) {
             this.logger.error("Error while cleaning up recording {}", this.name, e);
         }
+        synchronized (this) {
+            this.stopped = true;
+            this.out.abort();
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Sequenced side (always called while holding the lock)
+    // Called while holding the lock
 
     private void writeSnapshot(Snapshot snapshot) {
         this.out.submit(writer -> writer.startSnapshot());

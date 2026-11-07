@@ -1,6 +1,7 @@
 package com.moulberry.flashback.serverrecorder.api;
 
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.jspecify.annotations.Nullable;
 
@@ -13,7 +14,7 @@ import java.util.concurrent.CompletableFuture;
  * Public API for other plugins (e.g. a minigame) to control recordings.
  * <pre>{@code
  * FlashbackRecorderApi api = FlashbackRecorderApi.get();
- * RecordingHandle rec = api.recordCamera("bedwars-" + gameId, arenaCenter, 8, null);
+ * RecordingHandle rec = api.recordArea("duel-" + gameId, arenaCenter, 64);
  * ...
  * rec.marker("Red bed destroyed", 0xFF5555);
  * ...
@@ -27,23 +28,21 @@ public interface FlashbackRecorderApi {
         return com.moulberry.flashback.serverrecorder.FlashbackServerRecorder.instance();
     }
 
-    /** Records what a single player sees, like the Flashback mod would on their client. */
-    RecordingHandle recordPlayer(String name, Player player) throws IOException;
+    /**
+     * Records a whole world: terrain around all players, every entity and every player.
+     * Best for worlds that only contain one game (e.g. a world per arena).
+     */
+    RecordingHandle recordWorld(String name, World world) throws IOException;
 
     /**
-     * Records from an invisible camera placed at {@code location}. Everything within {@code viewDistance}
-     * chunks is recorded, no matter where players are.
-     *
-     * @param hudSource optional player whose scoreboard, tab list, boss bars, titles and chat are copied
+     * Records a square area of {@code radiusBlocks} around {@code center}: all terrain in it (as long as it's
+     * loaded), every entity and every player inside it.
      */
-    RecordingHandle recordCamera(String name, Location location, int viewDistance, @Nullable Player hudSource) throws IOException;
+    RecordingHandle recordArea(String name, Location center, int radiusBlocks) throws IOException;
 
     @Nullable RecordingHandle getRecording(String name);
 
     Collection<? extends RecordingHandle> getRecordings();
-
-    /** @return true if the player is a recording camera (cameras aren't in the online player list, but are in their world) */
-    boolean isCamera(org.bukkit.entity.Entity entity);
 
     interface RecordingHandle {
         String name();
@@ -56,6 +55,12 @@ public interface FlashbackRecorderApi {
 
         /** Adds a marker with a position (Flashback can jump the camera to it). */
         void marker(@Nullable String description, int rgbColour, Location location);
+
+        /**
+         * Sets whose scoreboard, tab list, boss bars, titles and chat end up in the replay.
+         * Null picks a player in the recorded world automatically (the default).
+         */
+        void setHudPlayer(@Nullable Player player);
 
         /** Stops the recording. The future completes with the exported zip once it's written. */
         CompletableFuture<Path> stop();

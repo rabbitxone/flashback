@@ -2,32 +2,32 @@ package com.moulberry.flashback.serverrecorder;
 
 import com.destroystokyo.paper.event.server.ServerTickEndEvent;
 import com.moulberry.flashback.serverrecorder.api.FlashbackRecorderApi;
-import com.moulberry.flashback.serverrecorder.camera.CameraRecording;
 import com.moulberry.flashback.serverrecorder.format.ReplayMarker;
-import com.moulberry.flashback.serverrecorder.recording.PlayerRecording;
-import com.moulberry.flashback.serverrecorder.recording.Recording;
+import com.moulberry.flashback.serverrecorder.format.ReplayVerifier;
+import com.moulberry.flashback.serverrecorder.recording.Region;
+import com.moulberry.flashback.serverrecorder.recording.WorldRecording;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ClientboundBlockDestructionPacket;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.phys.Vec3;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.CraftWorld;
 import org.bukkit.craftbukkit.entity.CraftEntity;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
-import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -37,7 +37,7 @@ import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -50,7 +50,7 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
 
     private static final DateTimeFormatter FILE_DATE = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
 
-    private static FlashbackServerRecorder instance;
+    private static @Nullable FlashbackServerRecorder instance;
 
     private final Map<String, Handle> recordings = new LinkedHashMap<>();
     private final List<CompletableFuture<Path>> pendingExports = new ArrayList<>();
@@ -77,7 +77,6 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         for (Handle handle : List.copyOf(this.recordings.values())) {
             handle.stop();
         }
-        // Give exports a chance to finish so nothing is lost on shutdown
         for (CompletableFuture<Path> future : List.copyOf(this.pendingExports)) {
             try {
                 future.get(60, TimeUnit.SECONDS);
@@ -92,22 +91,25 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     // API
 
     @Override
-    public Handle recordPlayer(String name, Player player) throws IOException {
-        this.checkName(name);
-        ServerPlayer serverPlayer = ((CraftPlayer) player).getHandle();
-        Recording recording = new PlayerRecording(this.log, name, this.tempFolder(), this.outputFile(name),
-            this.segmentLengthTicks(), serverPlayer);
-        return this.register(recording);
+    public Handle recordWorld(String name, World world) throws IOException {
+        return this.start(name, world, null, null);
     }
 
     @Override
-    public Handle recordCamera(String name, Location location, int viewDistance, @Nullable Player hudSource) throws IOException {
+    public Handle recordArea(String name, Location center, int radiusBlocks) throws IOException {
+        Region region = Region.around(center.getX(), center.getZ(), Math.max(16, Math.min(512, radiusBlocks)));
+        return this.start(name, center.getWorld(), region, null);
+    }
+
+    private Handle start(String name, World world, @Nullable Region region, @Nullable Vec3 startPosition) throws IOException {
         this.checkName(name);
-        ServerLevel level = ((CraftWorld) location.getWorld()).getHandle();
-        CameraRecording recording = new CameraRecording(this.log, name, this.tempFolder(), this.outputFile(name),
-            this.segmentLengthTicks(), level, location.getX(), location.getY(), location.getZ(), location.getYaw(), location.getPitch(),
-            Math.max(2, Math.min(32, viewDistance)), hudSource == null ? null : ((CraftPlayer) hudSource).getHandle());
-        return this.register(recording);
+        ServerLevel level = ((CraftWorld) world).getHandle();
+        WorldRecording recording = new WorldRecording(this.log, name, this.tempFolder(), this.outputFile(name), this.segmentLengthTicks(),
+            level, region, startPosition, this.getConfig().getInt("view-distance", 12));
+        Handle handle = new Handle(recording);
+        this.recordings.put(name.toLowerCase(Locale.ROOT), handle);
+        this.log.info("Started recording '{}' of world {}{}", name, world.getName(), region == null ? "" : " (" + region + ")");
+        return handle;
     }
 
     @Override
@@ -116,19 +118,8 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     }
 
     @Override
-    public Collection<Handle> getRecordings() {
+    public List<Handle> getRecordings() {
         return List.copyOf(this.recordings.values());
-    }
-
-    @Override
-    public boolean isCamera(Entity entity) {
-        net.minecraft.world.entity.Entity handle = ((CraftEntity) entity).getHandle();
-        for (Handle h : this.recordings.values()) {
-            if (h.recording instanceof CameraRecording camera && camera.camera() == handle) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void checkName(String name) {
@@ -140,23 +131,17 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         }
     }
 
-    private Handle register(Recording recording) {
-        Handle handle = new Handle(recording);
-        this.recordings.put(recording.name().toLowerCase(Locale.ROOT), handle);
-        this.log.info("Started recording '{}'", recording.name());
-        return handle;
-    }
-
     private Path tempFolder() {
         return this.getDataFolder().toPath().resolve("temp").resolve(UUID.randomUUID().toString());
     }
 
-    private Path outputFile(String name) {
+    private Path outputFolder() {
         Path folder = Path.of(this.getConfig().getString("output-folder", "replays"));
-        if (!folder.isAbsolute()) {
-            folder = this.getDataFolder().toPath().resolve(folder);
-        }
-        return folder.resolve(name + "_" + LocalDateTime.now().format(FILE_DATE) + ".zip");
+        return folder.isAbsolute() ? folder : this.getDataFolder().toPath().resolve(folder);
+    }
+
+    private Path outputFile(String name) {
+        return this.outputFolder().resolve(name + "_" + LocalDateTime.now().format(FILE_DATE) + ".zip");
     }
 
     private int segmentLengthTicks() {
@@ -164,9 +149,9 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     }
 
     public final class Handle implements RecordingHandle {
-        private final Recording recording;
+        private final WorldRecording recording;
 
-        private Handle(Recording recording) {
+        private Handle(WorldRecording recording) {
             this.recording = recording;
         }
 
@@ -192,6 +177,11 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         }
 
         @Override
+        public void setHudPlayer(@Nullable Player player) {
+            this.recording.setHudSource(player == null ? null : ((CraftPlayer) player).getHandle());
+        }
+
+        @Override
         public CompletableFuture<Path> stop() {
             FlashbackServerRecorder.this.recordings.remove(this.name().toLowerCase(Locale.ROOT));
             CompletableFuture<Path> future = this.recording.stop();
@@ -212,10 +202,6 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
             FlashbackServerRecorder.this.recordings.remove(this.name().toLowerCase(Locale.ROOT));
             this.recording.cancel();
         }
-
-        Recording recording() {
-            return this.recording;
-        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -229,35 +215,10 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
             } catch (Throwable t) {
                 this.log.error("Error while recording '{}', stopping it", handle.name(), t);
                 handle.stop();
-                continue;
-            }
-            if (handle.recording.isStopped() && this.recordings.containsValue(handle)) {
-                // Stopped by itself (e.g. viewer disconnected)
-                handle.stop();
             }
         }
         if (this.getConfig().getBoolean("auto-record.enabled", false) && Bukkit.getCurrentTick() % 20 == 0) {
             this.tickAutoRecord();
-        }
-    }
-
-    @EventHandler(priority = EventPriority.MONITOR)
-    public void onJoin(PlayerJoinEvent event) {
-        ServerPlayer player = ((CraftPlayer) event.getPlayer()).getHandle();
-        for (Handle handle : this.recordings.values()) {
-            if (handle.recording instanceof CameraRecording camera) {
-                camera.onPlayerJoin(player);
-            }
-        }
-    }
-
-    @EventHandler(priority = EventPriority.MONITOR)
-    public void onQuit(PlayerQuitEvent event) {
-        ServerPlayer player = ((CraftPlayer) event.getPlayer()).getHandle();
-        for (Handle handle : this.recordings.values()) {
-            if (handle.recording instanceof CameraRecording camera && camera.hudSource() == player) {
-                camera.setHudSource(null);
-            }
         }
     }
 
@@ -269,17 +230,15 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         Player player = event.getPlayer();
         Component message = event.deathMessage();
         String text = message == null ? player.getName() + " died" : PlainTextComponentSerializer.plainText().serialize(message);
+        ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
         for (Handle handle : this.recordings.values()) {
-            if (handle.recording.viewer().level() == ((CraftWorld) player.getWorld()).getHandle()) {
+            if (handle.recording.level() == level) {
                 handle.marker(text, 0xFF5555, player.getLocation());
             }
         }
     }
 
-    /**
-     * Block breaking progress is sent by looping over the player list (so cameras miss it) and never
-     * to the breaking player itself (so point-of-view recordings miss it). Recreate it from Paper's event.
-     */
+    /** Block breaking progress is never sent to the breaking player itself, so recreate it from Paper's event. */
     @EventHandler(priority = EventPriority.MONITOR)
     public void onBreakProgress(io.papermc.paper.event.block.BlockBreakProgressUpdateEvent event) {
         if (this.recordings.isEmpty()) {
@@ -287,25 +246,18 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         }
         net.minecraft.world.entity.Entity breaker = ((CraftEntity) event.getEntity()).getHandle();
         int stage = Math.round(event.getProgress() * 10.0f);
-        if (stage <= 0 || stage >= 10) {
-            stage = -1;
-        } else {
-            stage = Math.min(9, stage);
-        }
-        var pos = new net.minecraft.core.BlockPos(event.getBlock().getX(), event.getBlock().getY(), event.getBlock().getZ());
-        var packet = new net.minecraft.network.protocol.game.ClientboundBlockDestructionPacket(breaker.getId(), pos, stage);
+        stage = stage <= 0 || stage >= 10 ? -1 : Math.min(9, stage);
+        BlockPos pos = new BlockPos(event.getBlock().getX(), event.getBlock().getY(), event.getBlock().getZ());
+        ClientboundBlockDestructionPacket packet = new ClientboundBlockDestructionPacket(breaker.getId(), pos, stage);
         for (Handle handle : this.recordings.values()) {
-            ServerPlayer viewer = handle.recording.viewer();
-            boolean camera = handle.recording instanceof CameraRecording && viewer.level() == breaker.level()
-                && viewer.distanceToSqr(pos.getX(), pos.getY(), pos.getZ()) < 1024.0 * 16;
-            if (camera || viewer == breaker) {
-                handle.recording.writeSynthetic(packet);
+            if (handle.recording.level() == breaker.level()) {
+                handle.recording.writePacket(packet);
             }
         }
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Automatic arena recording
+    // Automatic recording
 
     private void tickAutoRecord() {
         ConfigurationSection arenas = this.getConfig().getConfigurationSection("auto-record.arenas");
@@ -321,7 +273,7 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
             if (world == null) {
                 continue;
             }
-            int players = world.getPlayers().stream().filter(p -> !this.isCamera(p)).toList().size();
+            int players = world.getPlayers().size();
             Handle running = this.autoRecordings.get(arena);
             if (running != null && !this.recordings.containsValue(running)) {
                 this.autoRecordings.remove(arena);
@@ -329,13 +281,12 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
             }
 
             if (running == null && players >= Math.max(1, section.getInt("min-players", 1))) {
-                Location location = new Location(world, section.getDouble("x"), section.getDouble("y"), section.getDouble("z"),
-                    (float) section.getDouble("yaw"), (float) section.getDouble("pitch"));
                 String name = arena + "-" + System.currentTimeMillis() / 1000;
                 try {
-                    Player hud = world.getPlayers().stream().filter(p -> !this.isCamera(p)).findFirst().orElse(null);
-                    this.autoRecordings.put(arena, this.recordCamera(name, location,
-                        section.getInt("view-distance", this.getConfig().getInt("camera-view-distance", 8)), hud));
+                    Handle handle = section.contains("radius")
+                        ? this.recordArea(name, new Location(world, section.getDouble("x"), 0, section.getDouble("z")), section.getInt("radius"))
+                        : this.recordWorld(name, world);
+                    this.autoRecordings.put(arena, handle);
                 } catch (Exception e) {
                     this.log.error("Unable to start automatic recording for arena {}", arena, e);
                 }
@@ -349,6 +300,10 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     // ---------------------------------------------------------------------------------------------
     // Commands
 
+    private static void send(CommandSender sender, String text, NamedTextColor colour) {
+        sender.sendMessage(Component.text(text, colour));
+    }
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
@@ -356,42 +311,43 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         }
         try {
             switch (args[0].toLowerCase(Locale.ROOT)) {
-                case "player" -> {
+                case "world" -> {
+                    // /fbrec world <name> [world]
                     if (args.length < 2) {
-                        sender.sendMessage(Component.text("/" + label + " player <player> [name]", NamedTextColor.RED));
+                        send(sender, "/" + label + " world <name> [world]", NamedTextColor.RED);
                         return true;
                     }
-                    Player target = Bukkit.getPlayerExact(args[1]);
-                    if (target == null) {
-                        sender.sendMessage(Component.text("Player not found", NamedTextColor.RED));
+                    World world = args.length >= 3 ? Bukkit.getWorld(args[2]) : sender instanceof Player p ? p.getWorld() : Bukkit.getWorlds().getFirst();
+                    if (world == null) {
+                        send(sender, "Unknown world " + args[2], NamedTextColor.RED);
                         return true;
                     }
-                    String name = args.length >= 3 ? args[2] : target.getName();
-                    this.recordPlayer(name, target);
-                    sender.sendMessage(Component.text("Recording '" + name + "' started (point of view of " + target.getName() + ")", NamedTextColor.GREEN));
+                    this.recordWorld(args[1], world);
+                    send(sender, "Recording '" + args[1] + "' started (whole world " + world.getName() + ")", NamedTextColor.GREEN);
                 }
-                case "camera" -> {
-                    // /fbrec camera [name] [viewDistance] [hudPlayer|-] [world x y z [yaw pitch]]
-                    Location location;
-                    if (args.length >= 8) {
-                        World world = Bukkit.getWorld(args[4]);
+                case "area" -> {
+                    // /fbrec area <name> <radius> [world x z]
+                    if (args.length < 3) {
+                        send(sender, "/" + label + " area <name> <radius in blocks> [world x z]", NamedTextColor.RED);
+                        return true;
+                    }
+                    Location center;
+                    if (args.length >= 6) {
+                        World world = Bukkit.getWorld(args[3]);
                         if (world == null) {
-                            sender.sendMessage(Component.text("Unknown world " + args[4], NamedTextColor.RED));
+                            send(sender, "Unknown world " + args[3], NamedTextColor.RED);
                             return true;
                         }
-                        location = new Location(world, Double.parseDouble(args[5]), Double.parseDouble(args[6]), Double.parseDouble(args[7]),
-                            args.length >= 9 ? Float.parseFloat(args[8]) : 0, args.length >= 10 ? Float.parseFloat(args[9]) : 0);
+                        center = new Location(world, Double.parseDouble(args[4]), 0, Double.parseDouble(args[5]));
                     } else if (sender instanceof Player player) {
-                        location = player.getLocation();
+                        center = player.getLocation();
                     } else {
-                        sender.sendMessage(Component.text("/" + label + " camera <name> <viewDistance> <hudPlayer|-> <world> <x> <y> <z> [yaw] [pitch]", NamedTextColor.RED));
+                        send(sender, "/" + label + " area <name> <radius> <world> <x> <z>", NamedTextColor.RED);
                         return true;
                     }
-                    String name = args.length >= 2 ? args[1] : "camera-" + System.currentTimeMillis() / 1000;
-                    int viewDistance = args.length >= 3 ? Integer.parseInt(args[2]) : this.getConfig().getInt("camera-view-distance", 8);
-                    Player hud = args.length >= 4 ? Bukkit.getPlayerExact(args[3]) : (sender instanceof Player p ? p : null);
-                    this.recordCamera(name, location, viewDistance, hud);
-                    sender.sendMessage(Component.text("Camera recording '" + name + "' started here (view distance " + viewDistance + ")", NamedTextColor.GREEN));
+                    int radius = Integer.parseInt(args[2]);
+                    this.recordArea(args[1], center, radius);
+                    send(sender, "Recording '" + args[1] + "' started (" + radius + " blocks around " + center.getBlockX() + ", " + center.getBlockZ() + ")", NamedTextColor.GREEN);
                 }
                 case "stop" -> {
                     List<Handle> toStop = new ArrayList<>();
@@ -400,90 +356,86 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
                     } else {
                         Handle handle = this.getRecording(args[1]);
                         if (handle == null) {
-                            sender.sendMessage(Component.text("No recording called " + args[1], NamedTextColor.RED));
+                            send(sender, "No recording called " + args[1], NamedTextColor.RED);
                             return true;
                         }
                         toStop.add(handle);
                     }
+                    if (toStop.isEmpty()) {
+                        send(sender, "Nothing is being recorded", NamedTextColor.YELLOW);
+                    }
                     for (Handle handle : toStop) {
                         handle.stop().whenComplete((path, error) -> Bukkit.getScheduler().runTask(this, () -> {
                             if (error != null) {
-                                sender.sendMessage(Component.text("Failed to save '" + handle.name() + "': " + error.getMessage(), NamedTextColor.RED));
+                                send(sender, "Failed to save '" + handle.name() + "': " + error.getMessage(), NamedTextColor.RED);
                             } else {
-                                sender.sendMessage(Component.text("Saved '" + handle.name() + "' to " + path, NamedTextColor.GREEN));
+                                send(sender, "Saved '" + handle.name() + "' to " + path, NamedTextColor.GREEN);
                             }
                         }));
-                    }
-                    if (toStop.isEmpty()) {
-                        sender.sendMessage(Component.text("Nothing is being recorded", NamedTextColor.YELLOW));
                     }
                 }
                 case "list" -> {
                     if (this.recordings.isEmpty()) {
-                        sender.sendMessage(Component.text("Nothing is being recorded", NamedTextColor.YELLOW));
+                        send(sender, "Nothing is being recorded", NamedTextColor.YELLOW);
                     }
                     for (Handle handle : this.recordings.values()) {
-                        String type = handle.recording instanceof CameraRecording ? "camera" : "player " + handle.recording.viewer().getPlainTextName();
-                        sender.sendMessage(Component.text(handle.name() + " (" + type + ", " + handle.recordedTicks() / 20 + "s)", NamedTextColor.AQUA));
+                        send(sender, handle.name() + " (" + handle.recording.level().getWorld().getName() + ", " + handle.recordedTicks() / 20 + "s)", NamedTextColor.AQUA);
                     }
                 }
                 case "marker" -> {
                     if (args.length < 2) {
-                        sender.sendMessage(Component.text("/" + label + " marker <name> [description]", NamedTextColor.RED));
+                        send(sender, "/" + label + " marker <name> [description]", NamedTextColor.RED);
                         return true;
                     }
                     Handle handle = this.getRecording(args[1]);
                     if (handle == null) {
-                        sender.sendMessage(Component.text("No recording called " + args[1], NamedTextColor.RED));
+                        send(sender, "No recording called " + args[1], NamedTextColor.RED);
                         return true;
                     }
-                    String description = args.length >= 3 ? String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length)) : null;
+                    String description = args.length >= 3 ? String.join(" ", Arrays.copyOfRange(args, 2, args.length)) : null;
                     if (sender instanceof Player player) {
                         handle.marker(description, 0x55FFFF, player.getLocation());
                     } else {
                         handle.marker(description, 0x55FFFF);
                     }
-                    sender.sendMessage(Component.text("Marker added", NamedTextColor.GREEN));
+                    send(sender, "Marker added", NamedTextColor.GREEN);
                 }
                 case "hud" -> {
                     if (args.length < 3) {
-                        sender.sendMessage(Component.text("/" + label + " hud <camera recording> <player|none>", NamedTextColor.RED));
+                        send(sender, "/" + label + " hud <recording> <player|auto>", NamedTextColor.RED);
                         return true;
                     }
                     Handle handle = this.getRecording(args[1]);
-                    if (handle == null || !(handle.recording instanceof CameraRecording camera)) {
-                        sender.sendMessage(Component.text("No camera recording called " + args[1], NamedTextColor.RED));
+                    if (handle == null) {
+                        send(sender, "No recording called " + args[1], NamedTextColor.RED);
                         return true;
                     }
                     Player hud = Bukkit.getPlayerExact(args[2]);
-                    camera.setHudSource(hud == null ? null : ((CraftPlayer) hud).getHandle());
-                    sender.sendMessage(Component.text("HUD source set to " + (hud == null ? "nobody" : hud.getName()), NamedTextColor.GREEN));
+                    handle.setHudPlayer(hud);
+                    send(sender, "Scoreboard/tab list/chat now come from " + (hud == null ? "an automatically chosen player" : hud.getName()), NamedTextColor.GREEN);
                 }
                 case "verify" -> {
                     if (args.length < 2) {
-                        sender.sendMessage(Component.text("/" + label + " verify <replay zip>", NamedTextColor.RED));
+                        send(sender, "/" + label + " verify <replay zip>", NamedTextColor.RED);
                         return true;
                     }
                     Path path = Path.of(args[1]);
-                    if (!path.isAbsolute()) {
-                        path = this.outputFile("x").getParent().resolve(args[1]);
-                    }
-                    var registryAccess = ((org.bukkit.craftbukkit.CraftServer) Bukkit.getServer()).getServer().registryAccess();
-                    Path finalPath = path;
+                    Path file = path.isAbsolute() ? path : this.outputFolder().resolve(args[1]);
+                    var registryAccess = ((CraftServer) Bukkit.getServer()).getServer().registryAccess();
                     Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
                         try {
-                            var result = com.moulberry.flashback.serverrecorder.format.ReplayVerifier.verify(finalPath, registryAccess);
-                            sender.sendMessage(Component.text("Ticks: " + result.totalTicks() + ", chunk files: " + result.chunkFiles()
-                                + ", actions: " + result.actions() + ", cached chunks: " + result.cachedChunks(), NamedTextColor.AQUA));
+                            var result = ReplayVerifier.verify(file, registryAccess);
+                            send(sender, "Ticks: " + result.totalTicks() + ", chunk files: " + result.chunkFiles()
+                                + ", actions: " + result.actions() + ", cached chunks: " + result.cachedChunks(), NamedTextColor.AQUA);
                             result.packetCounts().entrySet().stream().sorted(Map.Entry.comparingByKey())
-                                .forEach(e -> sender.sendMessage(Component.text("  " + e.getKey() + " x" + e.getValue(), NamedTextColor.GRAY)));
+                                .forEach(e -> send(sender, "  " + e.getKey() + " x" + e.getValue(), NamedTextColor.GRAY));
                             if (result.errors().isEmpty()) {
-                                sender.sendMessage(Component.text("Replay is valid", NamedTextColor.GREEN));
+                                send(sender, "Replay is valid", NamedTextColor.GREEN);
                             } else {
-                                result.errors().stream().limit(30).forEach(e -> sender.sendMessage(Component.text(e, NamedTextColor.RED)));
+                                result.errors().stream().limit(30).forEach(e -> send(sender, e, NamedTextColor.RED));
                             }
                         } catch (Exception e) {
-                            sender.sendMessage(Component.text("Unable to read replay: " + e, NamedTextColor.RED));
+                            send(sender, "Unable to read replay: " + e, NamedTextColor.RED);
                         }
                     });
                 }
@@ -492,7 +444,7 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
                 }
             }
         } catch (IllegalArgumentException | IOException e) {
-            sender.sendMessage(Component.text(e.getMessage(), NamedTextColor.RED));
+            send(sender, String.valueOf(e.getMessage()), NamedTextColor.RED);
         }
         return true;
     }
@@ -500,7 +452,7 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
-            return filter(List.of("player", "camera", "stop", "list", "marker", "hud", "verify"), args[0]);
+            return filter(List.of("world", "area", "stop", "list", "marker", "hud", "verify"), args[0]);
         }
         String sub = args[0].toLowerCase(Locale.ROOT);
         if (args.length == 2 && (sub.equals("stop") || sub.equals("marker") || sub.equals("hud"))) {
@@ -510,8 +462,13 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
             }
             return filter(names, args[1]);
         }
-        if ((args.length == 2 && sub.equals("player")) || (args.length == 3 && sub.equals("hud")) || (args.length == 4 && sub.equals("camera"))) {
-            return filter(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList(), args[args.length - 1]);
+        if ((args.length == 3 && sub.equals("world")) || (args.length == 4 && sub.equals("area"))) {
+            return filter(Bukkit.getWorlds().stream().map(World::getName).toList(), args[args.length - 1]);
+        }
+        if (args.length == 3 && sub.equals("hud")) {
+            List<String> names = new ArrayList<>(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
+            names.add("auto");
+            return filter(names, args[2]);
         }
         return List.of();
     }
