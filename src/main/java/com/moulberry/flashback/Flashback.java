@@ -284,6 +284,7 @@ public class Flashback implements ModInitializer, ClientModInitializer {
         ActionRegistry.register(ActionLevelChunkCached.INSTANCE);
         ActionRegistry.register(ActionAccuratePlayerPosition.INSTANCE);
         ActionRegistry.register(ActionRealTimeClock.INSTANCE);
+        ActionRegistry.register(ActionPlayerState.INSTANCE);
 
         KeyframeRegistry.register(CameraKeyframeType.INSTANCE);
         KeyframeRegistry.register(CameraOrbitKeyframeType.INSTANCE);

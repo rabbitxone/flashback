@@ -92,20 +92,36 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
 
     @Override
     public Handle recordWorld(String name, World world) throws IOException {
-        return this.start(name, world, null, null);
+        return this.start(name, world, null, null, null, 0, 30);
     }
 
     @Override
     public Handle recordArea(String name, Location center, int radiusBlocks) throws IOException {
-        Region region = Region.around(center.getX(), center.getZ(), Math.max(16, Math.min(512, radiusBlocks)));
-        return this.start(name, center.getWorld(), region, null);
+        return this.start(name, center.getWorld(), region(center, radiusBlocks), null, null, 0, 30);
     }
 
-    private Handle start(String name, World world, @Nullable Region region, @Nullable Vec3 startPosition) throws IOException {
+    @Override
+    public Handle recordCamera(String name, Location camera, int radiusBlocks) throws IOException {
+        Region region = radiusBlocks > 0 ? region(camera, radiusBlocks) : null;
+        return this.start(name, camera.getWorld(), region, null, new Vec3(camera.getX(), camera.getY(), camera.getZ()),
+            camera.getYaw(), camera.getPitch());
+    }
+
+    @Override
+    public Handle recordPlayer(String name, Player player) throws IOException {
+        return this.start(name, player.getWorld(), null, ((CraftPlayer) player).getHandle(), null, 0, 0);
+    }
+
+    private static Region region(Location center, int radiusBlocks) {
+        return Region.around(center.getX(), center.getZ(), Math.max(16, Math.min(512, radiusBlocks)));
+    }
+
+    private Handle start(String name, World world, @Nullable Region region, net.minecraft.server.level.@Nullable ServerPlayer focus,
+                         @Nullable Vec3 startPosition, float yaw, float pitch) throws IOException {
         this.checkName(name);
         ServerLevel level = ((CraftWorld) world).getHandle();
         WorldRecording recording = new WorldRecording(this.log, name, this.tempFolder(), this.outputFile(name), this.segmentLengthTicks(),
-            level, region, startPosition, this.getConfig().getInt("view-distance", 12));
+            level, region, focus, startPosition, yaw, pitch, this.getConfig().getInt("view-distance", 12));
         Handle handle = new Handle(recording);
         this.recordings.put(name.toLowerCase(Locale.ROOT), handle);
         this.log.info("Started recording '{}' of world {}{}", name, world.getName(), region == null ? "" : " (" + region + ")");
@@ -211,6 +227,12 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     public void onTickEnd(ServerTickEndEvent event) {
         for (Handle handle : List.copyOf(this.recordings.values())) {
             try {
+                String stopReason = handle.recording.shouldStop();
+                if (stopReason != null) {
+                    this.log.info("Stopping recording '{}': {}", handle.name(), stopReason);
+                    handle.stop();
+                    continue;
+                }
                 handle.recording.tick();
             } catch (Throwable t) {
                 this.log.error("Error while recording '{}', stopping it", handle.name(), t);
@@ -349,6 +371,46 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
                     this.recordArea(args[1], center, radius);
                     send(sender, "Recording '" + args[1] + "' started (" + radius + " blocks around " + center.getBlockX() + ", " + center.getBlockZ() + ")", NamedTextColor.GREEN);
                 }
+                case "camera" -> {
+                    // /fbrec camera <name> [radius] [world x y z [yaw pitch]]
+                    if (args.length < 2) {
+                        send(sender, "/" + label + " camera <name> [radius in blocks, 0 = whole world] [world x y z [yaw pitch]]", NamedTextColor.RED);
+                        return true;
+                    }
+                    int radius = args.length >= 3 ? Integer.parseInt(args[2]) : 0;
+                    Location camera;
+                    if (args.length >= 7) {
+                        World world = Bukkit.getWorld(args[3]);
+                        if (world == null) {
+                            send(sender, "Unknown world " + args[3], NamedTextColor.RED);
+                            return true;
+                        }
+                        camera = new Location(world, Double.parseDouble(args[4]), Double.parseDouble(args[5]), Double.parseDouble(args[6]),
+                            args.length >= 8 ? Float.parseFloat(args[7]) : 0, args.length >= 9 ? Float.parseFloat(args[8]) : 0);
+                    } else if (sender instanceof Player player) {
+                        camera = player.getEyeLocation();
+                    } else {
+                        send(sender, "/" + label + " camera <name> <radius> <world> <x> <y> <z> [yaw] [pitch]", NamedTextColor.RED);
+                        return true;
+                    }
+                    this.recordCamera(args[1], camera, radius);
+                    send(sender, "Recording '" + args[1] + "' started, camera placed at " + camera.getBlockX() + ", " + camera.getBlockY() + ", "
+                        + camera.getBlockZ() + (radius > 0 ? " (" + radius + " blocks around it)" : " (whole world)"), NamedTextColor.GREEN);
+                }
+                case "player" -> {
+                    // /fbrec player <name> <player>
+                    if (args.length < 3) {
+                        send(sender, "/" + label + " player <name> <player>", NamedTextColor.RED);
+                        return true;
+                    }
+                    Player target = Bukkit.getPlayerExact(args[2]);
+                    if (target == null) {
+                        send(sender, "Player not found", NamedTextColor.RED);
+                        return true;
+                    }
+                    this.recordPlayer(args[1], target);
+                    send(sender, "Recording '" + args[1] + "' started, following " + target.getName(), NamedTextColor.GREEN);
+                }
                 case "stop" -> {
                     List<Handle> toStop = new ArrayList<>();
                     if (args.length < 2 || args[1].equalsIgnoreCase("all")) {
@@ -452,7 +514,7 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
-            return filter(List.of("world", "area", "stop", "list", "marker", "hud", "verify"), args[0]);
+            return filter(List.of("world", "area", "camera", "player", "stop", "list", "marker", "hud", "verify"), args[0]);
         }
         String sub = args[0].toLowerCase(Locale.ROOT);
         if (args.length == 2 && (sub.equals("stop") || sub.equals("marker") || sub.equals("hud"))) {
@@ -464,6 +526,9 @@ public final class FlashbackServerRecorder extends JavaPlugin implements Listene
         }
         if ((args.length == 3 && sub.equals("world")) || (args.length == 4 && sub.equals("area"))) {
             return filter(Bukkit.getWorlds().stream().map(World::getName).toList(), args[args.length - 1]);
+        }
+        if (args.length == 3 && sub.equals("player")) {
+            return filter(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList(), args[2]);
         }
         if (args.length == 3 && sub.equals("hud")) {
             List<String> names = new ArrayList<>(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());

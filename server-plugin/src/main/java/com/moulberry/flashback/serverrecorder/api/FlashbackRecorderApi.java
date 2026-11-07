@@ -40,6 +40,18 @@ public interface FlashbackRecorderApi {
      */
     RecordingHandle recordArea(String name, Location center, int radiusBlocks) throws IOException;
 
+    /**
+     * Like {@link #recordArea}/{@link #recordWorld}, but the replay starts with the camera at {@code camera}
+     * (position and rotation). {@code radiusBlocks <= 0} records the whole world.
+     */
+    RecordingHandle recordCamera(String name, Location camera, int radiusBlocks) throws IOException;
+
+    /**
+     * Records the whole world of {@code player}, with that player as the replay's "local player": Flashback starts
+     * at them, can follow them and shows their scoreboard/tab list/chat. Stops when the player leaves the world.
+     */
+    RecordingHandle recordPlayer(String name, Player player) throws IOException;
+
     @Nullable RecordingHandle getRecording(String name);
 
     Collection<? extends RecordingHandle> getRecordings();

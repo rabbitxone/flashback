@@ -4,6 +4,8 @@ import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
 import ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer;
 import com.mojang.authlib.GameProfile;
 import com.mojang.datafixers.util.Pair;
+import com.moulberry.flashback.serverrecorder.format.FlashbackFormat;
+import com.moulberry.flashback.serverrecorder.format.ReplayWriter;
 import com.moulberry.flashback.serverrecorder.net.PacketCapture;
 import io.papermc.paper.adventure.PaperAdventure;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
@@ -38,6 +40,7 @@ import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.Leashable;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.GameType;
@@ -74,14 +77,19 @@ import java.util.function.Consumer;
  */
 public final class WorldRecording extends Recording {
 
-    /** Entity id of the (invisible) local player of the replay. Never used by the server. */
-    private static final int LOCAL_PLAYER_ID = Integer.MAX_VALUE - 1337;
-    private static final GameType LOCAL_GAME_TYPE = GameType.SPECTATOR;
+    /** Entity id of the (invisible) local player of the replay when no player is focused. Never used by the server. */
+    private static final int CAMERA_PLAYER_ID = Integer.MAX_VALUE - 1337;
+
+    /** Inventory slots sent with the player state action: the hotbar and the offhand. */
+    private static final int[] STATE_SLOTS = {0, 1, 2, 3, 4, 5, 6, 7, 8, Inventory.SLOT_OFFHAND};
 
     private final ServerLevel level;
     private final @Nullable Region region;
+    private final @Nullable ServerPlayer focus;
     private final GameProfile localProfile;
     private final Vec3 startPosition;
+    private final float startYaw;
+    private final float startPitch;
     private final int viewDistance;
 
     // Packet capture from players
@@ -109,16 +117,52 @@ public final class WorldRecording extends Recording {
         boolean wasSwinging;
         float lastSwingProgress;
         boolean wasDead;
+        // Player state action (hotbar etc.)
+        int selectedSlot = -1;
+        int food = -1;
+        float saturation = -1;
+        float xpProgress = -1;
+        int xpTotal = -1;
+        int xpLevel = -1;
+        final Map<Integer, ItemStack> slots = new HashMap<>();
     }
 
+    /**
+     * @param region        area to record, null for the whole world
+     * @param focus         player that becomes the replay's "local player" (followed by Flashback, HUD source), may be null
+     * @param startPosition where the replay camera starts, null for a sensible default
+     */
     public WorldRecording(Logger logger, String name, Path tempFolder, Path outputZip, int segmentLengthTicks,
-                          ServerLevel level, @Nullable Region region, @Nullable Vec3 startPosition, int viewDistance) throws IOException {
+                          ServerLevel level, @Nullable Region region, @Nullable ServerPlayer focus,
+                          @Nullable Vec3 startPosition, float startYaw, float startPitch, int viewDistance) throws IOException {
         super(logger, name, tempFolder, outputZip, segmentLengthTicks, level);
         this.level = level;
         this.region = region;
+        this.focus = focus;
         this.viewDistance = Math.max(2, Math.min(32, viewDistance));
-        this.localProfile = new GameProfile(UUID.randomUUID(), "Replay");
+        this.localProfile = focus != null ? focus.getGameProfile() : new GameProfile(UUID.randomUUID(), "Replay");
         this.startPosition = startPosition != null ? startPosition : this.defaultStartPosition();
+        this.startYaw = startYaw;
+        this.startPitch = startPitch;
+        if (focus != null) {
+            this.setHudSource(focus);
+        }
+    }
+
+    private int localPlayerId() {
+        return this.focus != null ? this.focus.getId() : CAMERA_PLAYER_ID;
+    }
+
+    private GameType localGameType() {
+        return this.focus != null ? this.focus.gameMode() : GameType.SPECTATOR;
+    }
+
+    @Override
+    public @Nullable String shouldStop() {
+        if (this.focus != null && (this.focus.hasDisconnected() || this.focus.level() != this.level)) {
+            return this.focus.getPlainTextName() + " left the recorded world";
+        }
+        return null;
     }
 
     private Vec3 defaultStartPosition() {
@@ -239,7 +283,8 @@ public final class WorldRecording extends Recording {
     }
 
     @Override
-    protected void collectTick(List<Packet<? super ClientGamePacketListener>> packets, List<IdAndPosition> positions) {
+    protected void collectTick(List<Packet<? super ClientGamePacketListener>> packets, List<IdAndPosition> positions,
+                               List<Consumer<ReplayWriter>> actions) {
         this.updateListeners();
         ChunkMap chunkMap = this.level.getChunkSource().chunkMap;
 
@@ -317,7 +362,7 @@ public final class WorldRecording extends Recording {
             if (entity instanceof ServerPlayer player) {
                 PlayerState state = this.playerStates.computeIfAbsent(id, k -> new PlayerState());
                 boolean dead = player.isDeadOrDying();
-                if (state.wasDead && !dead && this.spawned.contains(id)) {
+                if (state.wasDead && !dead && this.spawned.contains(id) && player != this.focus) {
                     // Respawned: Paper reuses the entity, but clients get it re-spawned
                     packets.add(new ClientboundRemoveEntitiesPacket(id));
                     this.spawned.remove(id);
@@ -328,9 +373,13 @@ public final class WorldRecording extends Recording {
             }
 
             if (this.spawned.add(id)) {
-                pairing(entity, chunkMap, packets, links);
+                // The focused player is the replay's local player, created by create_local_player instead
+                pairing(entity, chunkMap, packets, links, entity != this.focus);
             } else if (entity instanceof ServerPlayer player) {
                 this.collectPlayerChanges(player, packets);
+            }
+            if (entity instanceof ServerPlayer player) {
+                this.collectPlayerState(player, actions);
             }
 
             Vec3 pos = entity.trackingPosition();
@@ -344,7 +393,7 @@ public final class WorldRecording extends Recording {
 
         IntArrayList removed = new IntArrayList();
         for (int id : this.spawned) {
-            if (!present.contains(id)) {
+            if (!present.contains(id) && id != this.localPlayerId()) {
                 removed.add(id);
             }
         }
@@ -404,19 +453,97 @@ public final class WorldRecording extends Recording {
         state.lastSwingProgress = progress;
     }
 
+    /**
+     * Writes the flashback:action/player_state_optional action for everything that changed, so that
+     * spectating this player in the replay shows their hotbar, food and experience.
+     */
+    private void collectPlayerState(ServerPlayer player, List<Consumer<ReplayWriter>> actions) {
+        PlayerState state = this.playerStates.computeIfAbsent(player.getId(), k -> new PlayerState());
+        int flags = 0;
+
+        int selectedSlot = player.getInventory().getSelectedSlot();
+        if (selectedSlot != state.selectedSlot) {
+            state.selectedSlot = selectedSlot;
+            flags |= FlashbackFormat.PLAYER_STATE_HAS_SELECTED_SLOT;
+        }
+        var foodData = player.getFoodData();
+        if (foodData.getFoodLevel() != state.food || foodData.getSaturationLevel() != state.saturation) {
+            state.food = foodData.getFoodLevel();
+            state.saturation = foodData.getSaturationLevel();
+            flags |= FlashbackFormat.PLAYER_STATE_HAS_FOOD;
+        }
+        if (player.experienceProgress != state.xpProgress || player.totalExperience != state.xpTotal || player.experienceLevel != state.xpLevel) {
+            state.xpProgress = player.experienceProgress;
+            state.xpTotal = player.totalExperience;
+            state.xpLevel = player.experienceLevel;
+            flags |= FlashbackFormat.PLAYER_STATE_HAS_EXPERIENCE;
+        }
+        List<Pair<Integer, ItemStack>> changedSlots = new ArrayList<>();
+        for (int slot : STATE_SLOTS) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            ItemStack last = state.slots.get(slot);
+            if (last == null || !ItemStack.matches(last, stack)) {
+                ItemStack copy = stack.copy();
+                state.slots.put(slot, copy);
+                changedSlots.add(Pair.of(slot, copy));
+            }
+        }
+        if (!changedSlots.isEmpty()) {
+            flags |= FlashbackFormat.PLAYER_STATE_HAS_SLOTS;
+        }
+        if (flags == 0) {
+            return;
+        }
+
+        int entityId = player.getId();
+        int finalFlags = flags;
+        int food = state.food;
+        float saturation = state.saturation;
+        float xpProgress = state.xpProgress;
+        int xpTotal = state.xpTotal;
+        int xpLevel = state.xpLevel;
+        actions.add(writer -> {
+            var buf = writer.startAction(FlashbackFormat.ACTION_PLAYER_STATE);
+            buf.writeVarInt(entityId);
+            buf.writeByte(finalFlags);
+            if ((finalFlags & FlashbackFormat.PLAYER_STATE_HAS_SELECTED_SLOT) != 0) {
+                buf.writeVarInt(selectedSlot);
+            }
+            if ((finalFlags & FlashbackFormat.PLAYER_STATE_HAS_FOOD) != 0) {
+                buf.writeVarInt(food);
+                buf.writeFloat(saturation);
+            }
+            if ((finalFlags & FlashbackFormat.PLAYER_STATE_HAS_EXPERIENCE) != 0) {
+                buf.writeFloat(xpProgress);
+                buf.writeVarInt(xpTotal);
+                buf.writeVarInt(xpLevel);
+            }
+            if ((finalFlags & FlashbackFormat.PLAYER_STATE_HAS_SLOTS) != 0) {
+                buf.writeVarInt(changedSlots.size());
+                for (Pair<Integer, ItemStack> slot : changedSlots) {
+                    buf.writeVarInt(slot.getFirst());
+                    ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, slot.getSecond());
+                }
+            }
+            writer.finishAction(FlashbackFormat.ACTION_PLAYER_STATE);
+        });
+    }
+
     /** Packets that make a client aware of an entity, like ServerEntity#sendPairingData. */
     private void pairing(Entity entity, ChunkMap chunkMap, List<Packet<? super ClientGamePacketListener>> packets,
-                         List<Packet<? super ClientGamePacketListener>> links) {
+                         List<Packet<? super ClientGamePacketListener>> links, boolean addEntity) {
         ChunkMap.TrackedEntity tracked = chunkMap.entityMap.get(entity.getId());
         if (tracked == null) {
             return;
         }
         ServerEntity serverEntity = tracked.serverEntity;
-        try {
-            packets.add(entity.getAddEntityPacket(serverEntity));
-        } catch (Exception e) {
-            this.logger.debug("Unable to create spawn packet for {}", entity, e);
-            return;
+        if (addEntity) {
+            try {
+                packets.add(entity.getAddEntityPacket(serverEntity));
+            } catch (Exception e) {
+                this.logger.warn("Unable to create spawn packet for {}", entity, e);
+                return;
+            }
         }
 
         List<SynchedEntityData.DataValue<?>> data = entity.getEntityData().getNonDefaultValues();
@@ -485,13 +612,20 @@ public final class WorldRecording extends Recording {
         config.add(new ClientboundUpdateTagsPacket(TagNetworkSerialization.serializeTagsToNetwork(server.registries())));
 
         // Login of the (invisible) local player
+        GameType localGameType = this.localGameType();
+        int localPlayerId = this.localPlayerId();
         CommonPlayerSpawnInfo spawnInfo = new CommonPlayerSpawnInfo(this.level.dimensionTypeRegistration(), this.level.dimension(),
-            net.minecraft.world.level.biome.BiomeManager.obfuscateSeed(this.level.getSeed()), LOCAL_GAME_TYPE, Optional.empty(),
+            net.minecraft.world.level.biome.BiomeManager.obfuscateSeed(this.level.getSeed()), localGameType, Optional.empty(),
             this.level.isDebug(), this.level.isFlat(), Optional.empty(), 0, this.level.getSeaLevel());
-        ClientboundLoginPacket login = new ClientboundLoginPacket(LOCAL_PLAYER_ID, this.level.getLevelData().isHardcore(), server.levelKeys(),
+        ClientboundLoginPacket login = new ClientboundLoginPacket(localPlayerId, this.level.getLevelData().isHardcore(), server.levelKeys(),
             server.getPlayerList().getMaxPlayers(), this.viewDistance, this.viewDistance, false, true, false, spawnInfo, false, false);
-        LocalPlayerData localPlayer = new LocalPlayerData(this.localProfile.id(), this.startPosition.x, this.startPosition.y, this.startPosition.z,
-            30f, 0f, 0f, Vec3.ZERO, this.localProfile, LOCAL_GAME_TYPE);
+        LocalPlayerData localPlayer;
+        if (this.focus != null) {
+            localPlayer = LocalPlayerData.of(this.focus, localGameType);
+        } else {
+            localPlayer = new LocalPlayerData(this.localProfile.id(), this.startPosition.x, this.startPosition.y, this.startPosition.z,
+                this.startPitch, this.startYaw, this.startYaw, Vec3.ZERO, this.localProfile, localGameType);
+        }
 
         List<Packet<? super ClientGamePacketListener>> packets = new ArrayList<>();
 
@@ -505,11 +639,15 @@ public final class WorldRecording extends Recording {
         }
         ClientboundPlayerInfoUpdatePacket base = ClientboundPlayerInfoUpdatePacket.createPlayerInitializing(players);
         List<ClientboundPlayerInfoUpdatePacket.Entry> entries = new ArrayList<>(base.entries());
-        entries.add(new ClientboundPlayerInfoUpdatePacket.Entry(this.localProfile.id(), this.localProfile, false, 0, LOCAL_GAME_TYPE, null, true, 0, null));
+        if (this.focus == null) {
+            entries.add(new ClientboundPlayerInfoUpdatePacket.Entry(this.localProfile.id(), this.localProfile, false, 0, localGameType, null, true, 0, null));
+        }
         packets.add(new ClientboundPlayerInfoUpdatePacket(EnumSet.copyOf(base.actions()), entries));
 
-        // Make the local player invisible
-        packets.add(new ClientboundSetEntityDataPacket(LOCAL_PLAYER_ID, List.of(SynchedEntityData.DataValue.create(sharedFlagsAccessor(), (byte) 0x20))));
+        if (this.focus == null) {
+            // Make the camera's local player invisible
+            packets.add(new ClientboundSetEntityDataPacket(localPlayerId, List.of(SynchedEntityData.DataValue.create(sharedFlagsAccessor(), (byte) 0x20))));
+        }
 
         // HUD
         ServerPlayer hud = this.hudSource;
@@ -558,19 +696,25 @@ public final class WorldRecording extends Recording {
         this.lastPositions.clear();
         this.playerStates.clear();
         List<Packet<? super ClientGamePacketListener>> links = new ArrayList<>();
+        List<Consumer<ReplayWriter>> actions = new ArrayList<>();
+        if (this.focus != null) {
+            this.spawned.add(this.focus.getId());
+        }
         for (Entity entity : this.level.getAllEntities()) {
-            if (this.isRecorded(entity, chunkMap)) {
+            if (this.isRecorded(entity, chunkMap) || entity == this.focus) {
                 this.spawned.add(entity.getId());
-                pairing(entity, chunkMap, packets, links);
+                pairing(entity, chunkMap, packets, links, entity != this.focus);
                 if (entity instanceof ServerPlayer player) {
-                    this.playerStates.get(player.getId()).wasDead = player.isDeadOrDying();
+                    PlayerState state = this.playerStates.computeIfAbsent(player.getId(), k -> new PlayerState());
+                    state.wasDead = player.isDeadOrDying();
+                    this.collectPlayerState(player, actions);
                 }
             }
         }
         packets.addAll(links);
 
         this.logger.info("[{}] Snapshot: {} chunks, {} entities", this.name, chunkCount, this.spawned.size());
-        return new Snapshot(config, List.of(login), localPlayer, packets);
+        return new Snapshot(config, List.of(login), localPlayer, packets, actions);
     }
 
     /** Chunks to include in a snapshot, closest to the start position first. */

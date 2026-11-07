@@ -7,7 +7,7 @@ authors: [Moulberry, flashback contributors]
 commands:
   fbrec:
     description: Control server-side Flashback recordings
-    usage: /fbrec <world|area|stop|list|marker|hud|verify> ...
+    usage: /fbrec <world|area|camera|player|stop|list|marker|hud|verify> ...
     permission: flashbackrecorder.admin
 permissions:
   flashbackrecorder.admin:

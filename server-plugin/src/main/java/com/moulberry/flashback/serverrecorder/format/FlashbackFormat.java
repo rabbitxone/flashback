@@ -24,6 +24,13 @@ public final class FlashbackFormat {
     public static final Identifier ACTION_MOVE_ENTITIES = action("move_entities");
     public static final Identifier ACTION_LEVEL_CHUNK_CACHED = action("level_chunk_cached");
     public static final Identifier ACTION_REAL_TIME_CLOCK = action("real_time_clock_optional");
+    /** Hotbar/food/xp of any player. Added in this fork of Flashback, older versions skip it ("optional"). */
+    public static final Identifier ACTION_PLAYER_STATE = action("player_state_optional");
+
+    public static final int PLAYER_STATE_HAS_SELECTED_SLOT = 1;
+    public static final int PLAYER_STATE_HAS_FOOD = 2;
+    public static final int PLAYER_STATE_HAS_EXPERIENCE = 4;
+    public static final int PLAYER_STATE_HAS_SLOTS = 8;
 
     /** The action table written at the start of every replay chunk file (order defines the action ids). */
     public static final List<Identifier> ACTIONS = List.of(
@@ -33,7 +40,8 @@ public final class FlashbackFormat {
         ACTION_CREATE_LOCAL_PLAYER,
         ACTION_MOVE_ENTITIES,
         ACTION_LEVEL_CHUNK_CACHED,
-        ACTION_REAL_TIME_CLOCK
+        ACTION_REAL_TIME_CLOCK,
+        ACTION_PLAYER_STATE
     );
 
     private static Identifier action(String name) {

@@ -710,6 +710,11 @@ public class ReplayServer extends IntegratedServer {
         this.gamePacketHandler.handleCreateLocalPlayer(friendlyByteBuf);
     }
 
+    public void handlePlayerState(RegistryFriendlyByteBuf friendlyByteBuf) {
+        this.configurationPacketHandler.flushPendingConfiguration();
+        this.gamePacketHandler.handlePlayerState(friendlyByteBuf);
+    }
+
     public void handleAccuratePlayerPosition(RegistryFriendlyByteBuf friendlyByteBuf) {
         FlashbackConfigV1 config = Flashback.getConfig();
         if (config.advanced.disableIncreasedFirstPersonUpdates) {

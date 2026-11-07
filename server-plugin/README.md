@@ -24,11 +24,33 @@ Nagrywany jest **cały świat** (albo kwadratowy obszar wokół areny), bez kame
 Kod formatu (akcje, snapshoty, `level_chunk_caches`, `metadata.json`) to port klas z modu:
 `ReplayWriter`, `AsyncReplaySaver`, `ReplayExporter`, `Recorder#writeSnapshot`.
 
+## Tryby
+
+Wszystkie tryby nagrywają świat (teren, wszystkie encje i graczy). Różnią się obszarem i tym,
+gdzie startuje kamera w replayu:
+
+| Tryb | Obszar | Start kamery / „lokalny gracz” replayu |
+|------|--------|----------------------------------------|
+| `world`  | cały świat | przy pierwszym graczu |
+| `area`   | kwadrat wokół punktu | nad środkiem obszaru |
+| `camera` | cały świat albo kwadrat | dokładnie w Twoim miejscu i z Twoim kierunkiem patrzenia |
+| `player` | cały świat gracza | to ten gracz – Flashback startuje przy nim, może go śledzić, pokazuje jego scoreboard/czat; nagranie kończy się, gdy gracz wyjdzie ze świata |
+
+## Hotbar, jedzenie i XP przy Spectate
+
+Zwykły Flashback zna hotbar tylko gracza, który nagrywał na swoim kliencie – o innych graczach klient
+wie tylko, co trzymają w rękach. Plugin zapisuje dla **każdego** gracza dodatkową akcję
+`flashback:action/player_state_optional` (hotbar, offhand, wybrany slot, jedzenie, XP).
+Obsługuje ją ten fork Flashbacka (`ActionPlayerState`); oryginalny Flashback ją pomija
+(końcówka `_optional`), więc nagrania dalej się w nim otwierają, tylko bez hotbarów innych graczy.
+
 ## Komendy (`flashbackrecorder.admin`, domyślnie OP)
 
 ```
-/fbrec world <nazwa> [świat]                 # cały świat
-/fbrec area <nazwa> <promień> [świat x z]   # kwadrat wokół gracza albo podanych x/z
+/fbrec world <nazwa> [świat]                         # cały świat
+/fbrec area <nazwa> <promień> [świat x z]           # kwadrat wokół gracza albo podanych x/z
+/fbrec camera <nazwa> [promień] [świat x y z [yaw pitch]]   # promień 0 lub brak = cały świat
+/fbrec player <nazwa> <gracz>
 /fbrec stop <nazwa|all>
 /fbrec list
 /fbrec marker <nazwa> [opis...]
@@ -68,6 +90,8 @@ FlashbackRecorderApi api = FlashbackRecorderApi.get();
 // start gry
 RecordingHandle rec = api.recordArea("duel-" + gameId, arenaCenter, 64);
 // albo: api.recordWorld("bedwars-" + gameId, arenaWorld);
+// albo: api.recordCamera("duel-" + gameId, cameraLocation, 64);
+// albo: api.recordPlayer("pov-" + player.getName(), player);
 
 // w trakcie
 rec.marker("Pierwsza krew: " + killer.getName(), 0xFF5555, victim.getLocation());
@@ -88,6 +112,9 @@ cd server-plugin
 ```
 
 Wynik: `build/libs/flashback-server-recorder-<wersja>.jar`. Gotowy jar leży też w `dist/`.
+
+GitHub Actions (`.github/workflows/build.yml`) buduje przy każdym pushu zarówno plugin, jak i mod
+Flashback z tego forka – oba jary są do pobrania jako artefakty w zakładce **Actions** repozytorium.
 
 ## Ograniczenia
 

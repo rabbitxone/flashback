@@ -4,6 +4,7 @@ import com.moulberry.flashback.serverrecorder.format.FlashbackFormat;
 import com.moulberry.flashback.serverrecorder.format.ReplayFileWriter;
 import com.moulberry.flashback.serverrecorder.format.ReplayMarker;
 import com.moulberry.flashback.serverrecorder.format.ReplayMetadata;
+import com.moulberry.flashback.serverrecorder.format.ReplayWriter;
 import net.minecraft.SharedConstants;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.protocol.Packet;
@@ -20,6 +21,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
 /**
  * Format/bookkeeping side of a recording: replay chunk files ("segments"), snapshots, ticks,
@@ -95,8 +97,17 @@ public abstract class Recording {
     /** Builds a full snapshot of the current state. Main thread. */
     protected abstract Snapshot buildSnapshot();
 
-    /** Collects the packets and entity positions for the tick that just ended. Main thread. */
-    protected abstract void collectTick(List<Packet<? super ClientGamePacketListener>> packets, List<IdAndPosition> positions);
+    /**
+     * Collects the packets, entity positions and custom actions for the tick that just ended. Main thread.
+     * Custom actions run on the writer thread after the packets.
+     */
+    protected abstract void collectTick(List<Packet<? super ClientGamePacketListener>> packets, List<IdAndPosition> positions,
+                                        List<Consumer<ReplayWriter>> actions);
+
+    /** @return a reason if the recording should stop by itself (e.g. the recorded player left), otherwise null */
+    public @Nullable String shouldStop() {
+        return null;
+    }
 
     /** Releases listeners etc. once the recording is stopped. Main thread. */
     protected void cleanup() {
@@ -131,8 +142,9 @@ public abstract class Recording {
 
         List<Packet<? super ClientGamePacketListener>> packets = new ArrayList<>();
         List<IdAndPosition> positions = new ArrayList<>();
+        List<Consumer<ReplayWriter>> actions = new ArrayList<>();
         if (initialSnapshot == null) {
-            this.collectTick(packets, positions);
+            this.collectTick(packets, positions, actions);
         }
 
         this.mainTicksInSegment += 1;
@@ -154,6 +166,9 @@ public abstract class Recording {
                 this.writeRealTimeClock();
                 if (!packets.isEmpty()) {
                     this.out.writeGamePackets(packets);
+                }
+                for (Consumer<ReplayWriter> action : actions) {
+                    this.out.submit(action);
                 }
                 if (!positions.isEmpty()) {
                     this.writePositions(positions, dimension);
@@ -251,6 +266,9 @@ public abstract class Recording {
             writer.finishAction(FlashbackFormat.ACTION_CREATE_LOCAL_PLAYER);
         });
         this.out.writeGamePackets(snapshot.gamePackets());
+        for (Consumer<ReplayWriter> action : snapshot.actions()) {
+            this.out.submit(action);
+        }
         this.out.submit(writer -> writer.endSnapshot());
         this.forceRtc = true;
     }

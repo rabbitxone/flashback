@@ -156,6 +156,20 @@ public final class ReplayVerifier {
                                 errors.add(chunkName + ": references missing cached chunk " + index);
                             }
                             counts.addTo((inSnapshot ? "snapshot:" : "") + "level_chunk_cached", 1);
+                        } else if (action.equals(FlashbackFormat.ACTION_PLAYER_STATE)) {
+                            payload.readVarInt();
+                            int flags = payload.readByte();
+                            if ((flags & FlashbackFormat.PLAYER_STATE_HAS_SELECTED_SLOT) != 0) payload.readVarInt();
+                            if ((flags & FlashbackFormat.PLAYER_STATE_HAS_FOOD) != 0) { payload.readVarInt(); payload.readFloat(); }
+                            if ((flags & FlashbackFormat.PLAYER_STATE_HAS_EXPERIENCE) != 0) { payload.readFloat(); payload.readVarInt(); payload.readVarInt(); }
+                            if ((flags & FlashbackFormat.PLAYER_STATE_HAS_SLOTS) != 0) {
+                                int count = payload.readVarInt();
+                                for (int i = 0; i < count; i++) {
+                                    payload.readVarInt();
+                                    net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(payload);
+                                }
+                            }
+                            counts.addTo((inSnapshot ? "snapshot:" : "") + "player_state", 1);
                         } else if (action.equals(FlashbackFormat.ACTION_REAL_TIME_CLOCK)) {
                             if (payload.readByte() == 0) {
                                 payload.readLong();

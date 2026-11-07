@@ -1,5 +1,7 @@
 package com.moulberry.flashback.playback;
 
+import com.moulberry.flashback.action.ActionPlayerState;
+
 import ca.spottedleaf.starlight.common.chunk.ExtendedChunk;
 import ca.spottedleaf.starlight.common.light.SWMRNibbleArray;
 import ca.spottedleaf.starlight.common.light.StarLightEngine;
@@ -460,6 +462,51 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
     @Override
     public void handleContainerSetData(ClientboundContainerSetDataPacket clientboundContainerSetDataPacket) {
         throw new UnsupportedPacketException(clientboundContainerSetDataPacket);
+    }
+
+    public void handlePlayerState(RegistryFriendlyByteBuf buf) {
+        this.flushPendingEntities();
+
+        int entityId = buf.readVarInt();
+        int flags = buf.readByte();
+        Entity entity = this.getEntityOrPending(entityId);
+        Player player = entity instanceof Player p ? p : null;
+
+        if ((flags & ActionPlayerState.HAS_SELECTED_SLOT) != 0) {
+            int selectedSlot = buf.readVarInt();
+            if (player != null && Inventory.isHotbarSlot(selectedSlot)) {
+                player.getInventory().setSelectedSlot(selectedSlot);
+            }
+        }
+        if ((flags & ActionPlayerState.HAS_FOOD) != 0) {
+            int food = buf.readVarInt();
+            float saturation = buf.readFloat();
+            if (player != null) {
+                player.getFoodData().setFoodLevel(food);
+                player.getFoodData().setSaturation(saturation);
+            }
+        }
+        if ((flags & ActionPlayerState.HAS_EXPERIENCE) != 0) {
+            float progress = buf.readFloat();
+            int total = buf.readVarInt();
+            int level = buf.readVarInt();
+            if (player != null) {
+                player.experienceProgress = progress;
+                player.totalExperience = total;
+                player.experienceLevel = level;
+            }
+        }
+        if ((flags & ActionPlayerState.HAS_SLOTS) != 0) {
+            int count = buf.readVarInt();
+            for (int i = 0; i < count; i++) {
+                int slot = buf.readVarInt();
+                ItemStack itemStack = ItemStack.OPTIONAL_STREAM_CODEC.decode(buf);
+                if (player != null && slot >= 0 && slot < player.getInventory().getContainerSize()) {
+                    player.getInventory().setItem(slot, itemStack);
+                }
+            }
+        }
+        // Spectating viewers are updated by ReplayServer, which compares this state every tick
     }
 
     @Override
